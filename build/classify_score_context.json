@@ -1,0 +1,19 @@
+{
+  "source": "/workspace/STRUT-Unity/examples/classify_score.c",
+  "name": "classify_score",
+  "return_type": "int",
+  "parameters": [
+    {
+      "name": "score",
+      "c_type": "int"
+    }
+  ],
+  "dependencies": [],
+  "global_refs": [],
+  "branch_conditions": [
+    "score < 0",
+    "score >= 60"
+  ],
+  "tree_sitter_has_error": false,
+  "tree_sitter_function_count": 1
+}
