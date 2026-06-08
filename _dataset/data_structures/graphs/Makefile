@@ -13,7 +13,7 @@ Dijkstra: Dijkstra.c
 	$(CC) -o Dijkstra Dijkstra.c
 Floyd-Warshall: Floyd-Warshall.c
 	$(CC) -o Floyd-Warshall Floyd-Warshall.c
-Graph.o: Graph.c Graph.h
+Graph.o: Graph.c graph.h
 	$(CC) $(CFLAGS) -c Graph.c
 bfsQueue: Graph.o queue.o bfsQueue.o
 	$(CC) Graph.o queue.o bfsQueue.o -o bfsQueue

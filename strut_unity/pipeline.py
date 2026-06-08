@@ -15,6 +15,7 @@ from .coverage import collect_gcov_coverage, estimate_branch_coverage
 from .llm_cases import generate_llm_cases, generate_optimized_llm_cases
 from .llm_client import LLMConfig, OpenAICompatibleClient, write_llm_trace
 from .prompts import cases_to_strut_json
+from .stubs import stub_definitions, stub_function_names, stub_prelude
 from .unity_writer import write_unity_test
 
 
@@ -50,6 +51,11 @@ def run_pipeline(
         llm_model,
         llm_api_key,
     )
+    stubs = stub_function_names(context, cases)
+    if stubs:
+        test_source, callable_name = _prepare_test_source(source_path, build_dir, context.name, stubs)
+        context = replace(context, source=str(test_source), name=callable_name)
+        context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
     cases = _fill_expected_values(context, cases, source_path, build_dir)
     result = _write_compile_run_collect(context, cases, source_path, test_source, build_dir, context_path, "initial")
 
@@ -68,6 +74,11 @@ def run_pipeline(
         client,
     )
     extended_cases = _merge_cases(cases, optimized_cases)
+    stubs = stub_function_names(context, extended_cases)
+    if stubs:
+        test_source, callable_name = _prepare_test_source(source_path, build_dir, context.name, stubs)
+        context = replace(context, source=str(test_source), name=callable_name)
+        context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
     extended_cases = _fill_expected_values(context, extended_cases, source_path, build_dir)
     optimized_result = _write_compile_run_collect(context, extended_cases, source_path, test_source, build_dir, context_path, "optimized")
     optimized_trace = write_llm_trace(build_dir, f"{context.name}_optimization", prompt, response)
@@ -202,6 +213,8 @@ def _fill_expected_values(
     source_path: Path,
     build_dir: Path,
 ) -> list[TestCase]:
+    if _normalize_type(context.return_type) == "void":
+        return cases
     if not _is_supported_return_context(context):
         raise NotImplementedError(
             "The connector currently supports scalar returns, scalar/struct pointer returns, and struct value returns."
@@ -225,7 +238,10 @@ def _oracle_source(context: FunctionContext, cases: list[TestCase]) -> str:
     lines = [
         "#include <stdio.h>",
         "#include <stddef.h>",
+        *stub_prelude(context, cases),
         f'#include "{context.source}"',
+        "",
+        *stub_definitions(context, cases),
         "int main(void)",
         "{",
     ]
@@ -234,6 +250,8 @@ def _oracle_source(context: FunctionContext, cases: list[TestCase]) -> str:
         lines.append("    {")
         for declaration in _case_declarations(case):
             lines.append(f"        {declaration}")
+        if case.stubins:
+            lines.append(f"        __strut_stub_case_index = {index};")
         args = ", ".join(case.args)
         lines.append(_oracle_print(context, f"{context.name}({args})"))
         lines.append("    }")
@@ -391,9 +409,14 @@ def _strip_pointer(c_type: str) -> str:
     return c_type.replace("*", "").strip()
 
 
-def _prepare_test_source(source_path: Path, build_dir: Path, function_name: str) -> tuple[Path, str]:
+def _prepare_test_source(
+    source_path: Path,
+    build_dir: Path,
+    function_name: str,
+    stubbed_functions: set[str] | None = None,
+) -> tuple[Path, str]:
     source = source_path.read_bytes()
-    replacements = _main_identifier_replacements(source, function_name)
+    replacements = _identifier_replacements(source, function_name, stubbed_functions or set())
     if not replacements:
         return source_path, function_name
 
@@ -407,7 +430,11 @@ def _prepare_test_source(source_path: Path, build_dir: Path, function_name: str)
     return test_source, callable_name
 
 
-def _main_identifier_replacements(source: bytes, function_name: str) -> list[tuple[int, int, str]]:
+def _identifier_replacements(
+    source: bytes,
+    function_name: str,
+    stubbed_functions: set[str],
+) -> list[tuple[int, int, str]]:
     parser = Parser(Language(tree_sitter_c.language()))
     tree = parser.parse(source)
     replacements: list[tuple[int, int, str]] = []
@@ -415,10 +442,14 @@ def _main_identifier_replacements(source: bytes, function_name: str) -> list[tup
         if node.type != "function_definition":
             continue
         identifier = _function_identifier(node)
-        if identifier is None or source[identifier.start_byte : identifier.end_byte] != b"main":
+        if identifier is None:
             continue
-        replacement = "__strut_unity_target_main" if function_name == "main" else "__strut_unity_disabled_main"
-        replacements.append((identifier.start_byte, identifier.end_byte, replacement))
+        name = source[identifier.start_byte : identifier.end_byte].decode("utf-8", errors="replace")
+        if name == "main":
+            replacement = "__strut_unity_target_main" if function_name == "main" else "__strut_unity_disabled_main"
+            replacements.append((identifier.start_byte, identifier.end_byte, replacement))
+        elif name in stubbed_functions and name != function_name:
+            replacements.append((identifier.start_byte, identifier.end_byte, f"__strut_unity_original_{name}"))
     return replacements
 
 

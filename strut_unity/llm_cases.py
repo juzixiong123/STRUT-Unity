@@ -4,7 +4,7 @@ import json
 import re
 
 from .analyzer import FunctionContext
-from .cases import TestCase, case_from_args, case_from_structured_inputs
+from .cases import OutputValue, StubIn, TestCase, case_from_args, case_from_structured_inputs
 from .llm_client import OpenAICompatibleClient
 from .prompts import build_case_generation_messages, build_optimization_messages
 
@@ -53,15 +53,49 @@ def parse_llm_cases(response: str, context: FunctionContext) -> list[TestCase]:
 
 
 def _case_from_item(item: dict, context: FunctionContext, desc: str) -> TestCase:
+    stubins = _parse_stubins(item)
+    outputs = _parse_outputs(item)
     if "args" in item:
-        return case_from_args(context, desc, list(item["args"]))
+        return case_from_args(context, desc, list(item["args"]), stubins=stubins, outputs=outputs)
 
     inputs = item.get("inputs")
     if not isinstance(inputs, list):
         raise ValueError("LLM case must contain either args or inputs")
 
     values_by_expr = {str(entry.get("expr")): entry.get("value") for entry in inputs if isinstance(entry, dict)}
-    return case_from_structured_inputs(context, desc, values_by_expr)
+    return case_from_structured_inputs(context, desc, values_by_expr, stubins=stubins, outputs=outputs)
+
+
+def _parse_stubins(item: dict) -> tuple[StubIn, ...]:
+    raw_stubs = item.get("stubins", item.get("stubs", []))
+    if not isinstance(raw_stubs, list):
+        return ()
+    stubins = []
+    for raw in raw_stubs:
+        if not isinstance(raw, dict):
+            continue
+        called = raw.get("called function") or raw.get("called_function") or raw.get("function") or ""
+        changed = raw.get("changed variable", raw.get("changed_variable", raw.get("outputs", [])))
+        if not isinstance(changed, list):
+            changed = []
+        values = tuple(_output_value(entry) for entry in changed if isinstance(entry, dict))
+        stubins.append(StubIn(called_function=str(called), changed_variables=values))
+    return tuple(stubins)
+
+
+def _parse_outputs(item: dict) -> tuple[OutputValue, ...]:
+    raw_outputs = item.get("outputs", [])
+    if not isinstance(raw_outputs, list):
+        return ()
+    return tuple(_output_value(entry) for entry in raw_outputs if isinstance(entry, dict))
+
+
+def _output_value(entry: dict) -> OutputValue:
+    return OutputValue(
+        expr=str(entry.get("expr", "")),
+        c_type=str(entry.get("type", entry.get("c_type", "int"))),
+        value=entry.get("value"),
+    )
 
 
 def _extract_json(text: str) -> str:

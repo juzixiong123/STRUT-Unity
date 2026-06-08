@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-DEFAULT_LOCAL_OLLAMA_MODEL = "qwen3.6:27b"
+DEFAULT_LOCAL_OLLAMA_MODEL = "qwen3.5:latest"
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,7 @@ def _default_local_ollama_model(base_url: str) -> str:
             installed_models.append(parts[0])
     for model in installed_models:
         normalized = model.lower()
-        if "qwen3.6" in normalized and "27b" in normalized:
+        if "qwen3.5" in normalized:
             return model
     return DEFAULT_LOCAL_OLLAMA_MODEL
 

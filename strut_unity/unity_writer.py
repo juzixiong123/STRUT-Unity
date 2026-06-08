@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .analyzer import FunctionContext
-from .cases import TestCase
+from .cases import OutputValue, TestCase, convert_inputs_with_default_ptr, default_ptr_entries
+from .stubs import stub_definitions, stub_prelude
 
 
 def write_unity_test(context: FunctionContext, cases: list[TestCase], output_path: str | Path) -> Path:
@@ -12,8 +13,10 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
     lines = [
         '#include "unity.h"',
         "#include <stddef.h>",
+        *stub_prelude(context, cases),
         f'#include "{context.source}"',
         "",
+        *stub_definitions(context, cases),
         "void setUp(void) {}",
         "void tearDown(void) {}",
         "",
@@ -29,8 +32,20 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
         )
         for declaration in _case_declarations(case):
             lines.append(f"    {declaration}")
-        for assertion in _assertions(context, case.expected, f"{context.name}({args})"):
+        if case.stubins:
+            lines.append(f"    __strut_stub_case_index = {index};")
+        actual = "__strut_actual"
+        if _normalize_type(context.return_type) == "void":
+            lines.append(f"    {context.name}({args});")
+        else:
+            lines.append(f"    {context.return_type} {actual} = {context.name}({args});")
+        for assertion in _assertions(context, case.expected, actual):
             lines.append(f"    {assertion}")
+        for case_output in case.outputs:
+            if _normalize_expr(case_output.expr) == _normalize_expr(f"{context.name}({', '.join(parameter.name for parameter in context.parameters)})"):
+                continue
+            for assertion in _output_assertions(_resolve_output_expr(context, case_output)):
+                lines.append(f"    {assertion}")
         lines.extend(["}", ""])
 
     lines.extend(
@@ -66,6 +81,8 @@ def _case_declarations(case: TestCase) -> list[str]:
 
 
 def _assertions(context: FunctionContext, expected, actual: str) -> list[str]:
+    if expected is None:
+        return []
     if context.return_type_kind == "pointer" and isinstance(expected, dict):
         return _pointer_assertions(context, expected, actual)
     if context.return_type_kind == "composite" and isinstance(expected, dict):
@@ -74,27 +91,60 @@ def _assertions(context: FunctionContext, expected, actual: str) -> list[str]:
 
 
 def _pointer_assertions(context: FunctionContext, expected: dict, actual: str) -> list[str]:
-    lines = [f"{context.return_type} __strut_actual = {actual};"]
+    lines = []
     if expected.get("is_null"):
-        lines.append("TEST_ASSERT_NULL(__strut_actual);")
+        lines.append(f"TEST_ASSERT_NULL({actual});")
         return lines
 
-    lines.append("TEST_ASSERT_NOT_NULL(__strut_actual);")
+    lines.append(f"TEST_ASSERT_NOT_NULL({actual});")
     if "value" in expected:
         pointee_type = context.return_pointee_type or _strip_pointer(context.return_type)
-        lines.append(_assertion(pointee_type, expected["value"], "*__strut_actual") + ";")
+        lines.append(_assertion(pointee_type, expected["value"], f"*{actual}") + ";")
     fields = expected.get("fields")
     if isinstance(fields, dict):
-        lines.extend(_field_assertions(context.return_fields, fields, "__strut_actual", pointer=True))
+        lines.extend(_field_assertions(context.return_fields, fields, actual, pointer=True))
     return lines
 
 
 def _struct_assertions(context: FunctionContext, expected: dict, actual: str) -> list[str]:
-    lines = [f"{context.return_type} __strut_actual = {actual};"]
+    lines = []
     fields = expected.get("fields")
     if isinstance(fields, dict):
-        lines.extend(_field_assertions(context.return_fields, fields, "__strut_actual", pointer=False))
+        lines.extend(_field_assertions(context.return_fields, fields, actual, pointer=False))
     return lines
+
+
+def _output_assertions(output: OutputValue) -> list[str]:
+    return _generic_output_assertions(output.expr, output.c_type, output.value)
+
+
+def _resolve_output_expr(context: FunctionContext, output: OutputValue) -> OutputValue:
+    converted = convert_inputs_with_default_ptr(
+        [{"expr": output.expr, "type": output.c_type, "value": output.value}],
+        default_ptr_entries(context),
+    )[0]["expr"]
+    return OutputValue(expr=converted, c_type=output.c_type, value=output.value)
+
+
+def _generic_output_assertions(expr: str, c_type: str, expected) -> list[str]:
+    if isinstance(expected, dict):
+        lines = []
+        if "is_null" in expected:
+            if expected.get("is_null"):
+                lines.append(f"TEST_ASSERT_NULL({expr});")
+                return lines
+            lines.append(f"TEST_ASSERT_NOT_NULL({expr});")
+        fields = expected.get("fields")
+        if isinstance(fields, dict):
+            pointer = "*" in c_type or c_type.strip().endswith("]")
+            for name, value in fields.items():
+                access = f"{expr}->{name}" if pointer else f"{expr}.{name}"
+                lines.extend(_generic_output_assertions(access, "int", value))
+        if "value" in expected:
+            access = f"*{expr}" if "*" in c_type else expr
+            lines.append(_assertion(_strip_pointer(c_type), expected["value"], access) + ";")
+        return lines
+    return [_assertion(c_type, expected, expr) + ";"]
 
 
 def _field_assertions(fields, expected_fields: dict, base: str, pointer: bool) -> list[str]:
@@ -123,13 +173,31 @@ def _field_assertions(fields, expected_fields: dict, base: str, pointer: bool) -
 
 
 def _assertion(c_type: str, expected: str | int | float | None, actual: str) -> str:
-    expected_value = expected if expected is not None else _zero_for_type(c_type)
+    expected_value = _literal_for_assertion(c_type, expected)
     normalized = _normalize_type(c_type)
+    if normalized in {"char *", "const char *"} or normalized.endswith("[]"):
+        return f"TEST_ASSERT_EQUAL_STRING({expected_value}, {actual})"
+    if "*" in normalized and expected_value == "NULL":
+        return f"TEST_ASSERT_NULL({actual})"
     if normalized == "float":
         return f"TEST_ASSERT_FLOAT_WITHIN(0.0001f, {expected_value}f, {actual})"
     if normalized == "double":
         return f"TEST_ASSERT_DOUBLE_WITHIN(0.000001, {expected_value}, {actual})"
     return f"TEST_ASSERT_EQUAL_INT({expected_value}, {actual})"
+
+
+def _literal_for_assertion(c_type: str, expected: str | int | float | None) -> str:
+    if expected is None:
+        return _zero_for_type(c_type)
+    if isinstance(expected, bool):
+        return "1" if expected else "0"
+    if isinstance(expected, (int, float)):
+        return str(expected)
+    text = str(expected).strip()
+    normalized = _normalize_type(c_type)
+    if normalized in {"char *", "const char *"} or normalized.endswith("[]"):
+        return text if text.startswith('"') else f'"{text}"'
+    return text
 
 
 def _zero_for_type(c_type: str) -> str:
@@ -144,3 +212,7 @@ def _normalize_type(c_type: str) -> str:
 
 def _strip_pointer(c_type: str) -> str:
     return c_type.replace("*", "").strip()
+
+
+def _normalize_expr(expr: str) -> str:
+    return "".join(expr.split())

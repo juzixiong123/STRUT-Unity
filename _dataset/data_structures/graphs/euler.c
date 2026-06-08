@@ -1,6 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
-#include "Graph.h"
+#include "graph.h"
 
 // Return the number of vertices that v is
 // connected to

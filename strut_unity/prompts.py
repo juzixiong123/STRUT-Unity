@@ -86,6 +86,7 @@ def _render_template(
     context_payload = {
         "function": context.name,
         "dependencies": context.dependencies,
+        "dependency_details": asdict(context.dependency_details),
         "global_refs": context.global_refs,
         "interface_data": {
             "return_type": context.return_type,

@@ -29,7 +29,7 @@ By default the LLM client uses:
 
 ```sh
 STRUT_LLM_BASE_URL=http://127.0.0.1:11434/v1
-STRUT_LLM_MODEL=qwen3.6:27b
+STRUT_LLM_MODEL=qwen3.5:latest
 ```
 
 You can also call the pipeline directly:

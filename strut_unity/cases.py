@@ -15,6 +15,19 @@ class InputValue:
 
 
 @dataclass(frozen=True)
+class OutputValue:
+    expr: str
+    c_type: str
+    value: Any
+
+
+@dataclass(frozen=True)
+class StubIn:
+    called_function: str
+    changed_variables: tuple[OutputValue, ...]
+
+
+@dataclass(frozen=True)
 class ArgumentBinding:
     parameter: str
     c_type: str
@@ -28,6 +41,8 @@ class TestCase:
     desc: str
     bindings: tuple[ArgumentBinding, ...]
     expected: Any | None = None
+    stubins: tuple[StubIn, ...] = ()
+    outputs: tuple[OutputValue, ...] = ()
 
     @property
     def args(self) -> tuple[str, ...]:
@@ -38,7 +53,12 @@ class TestCase:
         return tuple(value for binding in self.bindings for value in binding.inputs)
 
     def identity(self) -> tuple[tuple[str, str], ...]:
-        return tuple((value.expr, value.value) for value in self.input_values)
+        stub_identity = tuple(
+            (stub.called_function, change.expr, str(change.value))
+            for stub in self.stubins
+            for change in stub.changed_variables
+        )
+        return tuple((value.expr, value.value) for value in self.input_values) + stub_identity
 
 
 def default_ptr_entries(context: FunctionContext) -> list[dict[str, str]]:
@@ -64,19 +84,29 @@ def to_original_seed_case(context: FunctionContext, case: TestCase, backend: boo
     if backend:
         inputs = convert_inputs_with_default_ptr(inputs, default_ptr_entries(context))
 
+    return_expr = _return_expr(context)
     outputs = []
     if case.expected is not None:
         outputs.append(
             {
-                "expr": f"{context.name}({', '.join(parameter.name for parameter in context.parameters)})",
+                "expr": return_expr,
                 "type": context.return_type,
                 "value": case.expected,
             }
         )
+    outputs.extend(
+        {
+            "expr": output.expr,
+            "type": output.c_type,
+            "value": output.value,
+        }
+        for output in case.outputs
+        if _normalize_expr(output.expr) != _normalize_expr(return_expr)
+    )
     return {
         "desc": case.desc,
         "inputs": inputs,
-        "stubins": [],
+        "stubins": [_stub_to_json(stub) for stub in case.stubins],
         "outputs": outputs,
         "doBoundary": 0,
         "ioins": [],
@@ -85,6 +115,24 @@ def to_original_seed_case(context: FunctionContext, case: TestCase, backend: boo
 
 def convert_inputs_with_default_ptr(inputs: list[dict[str, Any]], default_ptr: list[dict[str, str]]) -> list[dict[str, Any]]:
     return [{**item, "expr": _convert_expr_with_default_ptr(str(item.get("expr", "")), default_ptr)} for item in inputs]
+
+
+def _stub_to_json(stub: StubIn) -> dict[str, Any]:
+    return {
+        "called function": stub.called_function,
+        "changed variable": [
+            {
+                "expr": value.expr,
+                "type": value.c_type,
+                "value": value.value,
+            }
+            for value in stub.changed_variables
+        ],
+    }
+
+
+def _return_expr(context: FunctionContext) -> str:
+    return f"{context.name}({', '.join(parameter.name for parameter in context.parameters)})"
 
 
 def generate_seed_cases(context: FunctionContext) -> list[TestCase]:
@@ -118,7 +166,13 @@ def generate_seed_cases(context: FunctionContext) -> list[TestCase]:
     return cases
 
 
-def case_from_structured_inputs(context: FunctionContext, desc: str, values_by_expr: dict[str, object]) -> TestCase:
+def case_from_structured_inputs(
+    context: FunctionContext,
+    desc: str,
+    values_by_expr: dict[str, object],
+    stubins: tuple[StubIn, ...] = (),
+    outputs: tuple[OutputValue, ...] = (),
+) -> TestCase:
     normalized_values = {_normalize_expr(str(expr)): value for expr, value in values_by_expr.items()}
     bindings = []
     for parameter in context.parameters:
@@ -127,19 +181,31 @@ def case_from_structured_inputs(context: FunctionContext, desc: str, values_by_e
             bindings.append(_null_pointer_binding(parameter))
             continue
         bindings.append(_binding_for_parameter(parameter, _format_value(value), overrides=_format_overrides(normalized_values)))
-    return TestCase(desc=desc, bindings=tuple(bindings))
+    return TestCase(desc=desc, bindings=tuple(bindings), stubins=stubins, outputs=outputs)
 
 
-def case_from_args(context: FunctionContext, desc: str, args: list[object]) -> TestCase:
+def case_from_args(
+    context: FunctionContext,
+    desc: str,
+    args: list[object],
+    stubins: tuple[StubIn, ...] = (),
+    outputs: tuple[OutputValue, ...] = (),
+) -> TestCase:
     bindings = []
     for index, parameter in enumerate(context.parameters):
         value = args[index] if index < len(args) else _default_value(parameter)
         bindings.append(_binding_for_parameter(parameter, _format_value(value)))
-    return TestCase(desc=desc, bindings=tuple(bindings))
+    return TestCase(desc=desc, bindings=tuple(bindings), stubins=stubins, outputs=outputs)
 
 
 def with_expected(case: TestCase, expected: Any) -> TestCase:
-    return TestCase(desc=case.desc, bindings=case.bindings, expected=expected)
+    return TestCase(
+        desc=case.desc,
+        bindings=case.bindings,
+        expected=expected,
+        stubins=case.stubins,
+        outputs=case.outputs,
+    )
 
 
 def _append_case(cases: list[TestCase], seen: set[tuple[tuple[str, str], ...]], case: TestCase) -> None:
