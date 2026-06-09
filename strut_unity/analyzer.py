@@ -44,12 +44,29 @@ class DependencyItem:
 
 
 @dataclass(frozen=True)
+class CalleeInterface:
+    name: str
+    signature: str | None
+    return_type: str
+    return_type_kind: str
+    return_pointee_type: str | None
+    return_element_type: str | None
+    return_fields: list[TypeField]
+    parameters: list[Parameter]
+    pointer_parameters: list[Parameter]
+    file: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+
+
+@dataclass(frozen=True)
 class DependencyDetails:
     macros: list[DependencyItem]
     typedefs: list[DependencyItem]
     structs: list[DependencyItem]
     global_variables: list[DependencyItem]
     callee_declarations: list[DependencyItem]
+    callee_interfaces: list[CalleeInterface]
 
 
 @dataclass(frozen=True)
@@ -289,6 +306,11 @@ def _dependency_details(
         for item in (_callee_declaration_item(cursor) for cursor in callee_cursors)
         if item is not None
     ]
+    callee_interfaces = [
+        item
+        for item in (_callee_interface(cursor) for cursor in callee_cursors)
+        if item is not None
+    ]
 
     macro_names = _referenced_macro_names(root, function, source)
     dependency_sources = "\n".join(
@@ -307,6 +329,7 @@ def _dependency_details(
         structs=_dedupe_items(structs),
         global_variables=_dedupe_items(global_variables),
         callee_declarations=_dedupe_items(callee_declarations),
+        callee_interfaces=_dedupe_callee_interfaces(callee_interfaces),
     )
 
 
@@ -347,6 +370,32 @@ def _callee_declaration_item(cursor) -> DependencyItem | None:
         start_line=start_line,
         end_line=end_line,
         source=source or prototype,
+    )
+
+
+def _callee_interface(cursor) -> CalleeInterface | None:
+    if not hasattr(cursor, "result_type") or not cursor.spelling:
+        return None
+    location = _cursor_location(cursor)
+    file_path = start_line = end_line = None
+    if location is not None:
+        file_path, start_line, end_line = location
+
+    return_info = _type_info(cursor.result_type)
+    parameters = [_parameter_from_cursor(argument) for argument in cursor.get_arguments()]
+    return CalleeInterface(
+        name=cursor.spelling,
+        signature=_function_prototype(cursor),
+        return_type=cursor.result_type.spelling,
+        return_type_kind=return_info["type_kind"],
+        return_pointee_type=return_info["pointee_type"],
+        return_element_type=return_info["element_type"],
+        return_fields=return_info["fields"],
+        parameters=parameters,
+        pointer_parameters=[parameter for parameter in parameters if parameter.type_kind == "pointer"],
+        file=str(file_path) if file_path is not None else None,
+        start_line=start_line,
+        end_line=end_line,
     )
 
 
@@ -445,6 +494,18 @@ def _dedupe_items(items: list[DependencyItem]) -> list[DependencyItem]:
     unique: list[DependencyItem] = []
     for item in items:
         key = (item.kind, item.name, item.file, item.start_line, item.end_line, item.source)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _dedupe_callee_interfaces(items: list[CalleeInterface]) -> list[CalleeInterface]:
+    seen: set[tuple[str, str | None, str | None, int | None, int | None]] = set()
+    unique: list[CalleeInterface] = []
+    for item in items:
+        key = (item.name, item.signature, item.file, item.start_line, item.end_line)
         if key in seen:
             continue
         seen.add(key)

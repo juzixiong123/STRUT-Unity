@@ -6,16 +6,15 @@ import json
 from pathlib import Path
 import subprocess
 
-from tree_sitter import Language, Parser
-import tree_sitter_c
-
 from .analyzer import analyze_function, FunctionContext
-from .cases import generate_seed_cases, TestCase, with_expected
+from .cases import generate_seed_cases, TestCase
 from .coverage import collect_gcov_coverage, estimate_branch_coverage
 from .llm_cases import generate_llm_cases, generate_optimized_llm_cases
 from .llm_client import LLMConfig, OpenAICompatibleClient, write_llm_trace
+from .oracle import fill_expected_values
 from .prompts import cases_to_strut_json
-from .stubs import stub_definitions, stub_function_names, stub_prelude
+from .source_rewriter import prepare_test_source
+from .stubs import stub_function_names
 from .unity_writer import write_unity_test
 
 
@@ -36,7 +35,7 @@ def run_pipeline(
     build_dir.mkdir(exist_ok=True)
 
     context = analyze_function(source_path, function)
-    test_source, callable_name = _prepare_test_source(source_path, build_dir, context.name)
+    test_source, callable_name = prepare_test_source(source_path, build_dir, context.name)
     context = replace(context, source=str(test_source), name=callable_name)
     source_code = source_path.read_text(encoding="utf-8")
     context_path = build_dir / f"{context.name}_context.json"
@@ -53,10 +52,10 @@ def run_pipeline(
     )
     stubs = stub_function_names(context, cases)
     if stubs:
-        test_source, callable_name = _prepare_test_source(source_path, build_dir, context.name, stubs)
+        test_source, callable_name = prepare_test_source(source_path, build_dir, context.name, stubs)
         context = replace(context, source=str(test_source), name=callable_name)
         context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
-    cases = _fill_expected_values(context, cases, source_path, build_dir)
+    cases = fill_expected_values(context, cases, source_path, build_dir)
     result = _write_compile_run_collect(context, cases, source_path, test_source, build_dir, context_path, "initial")
 
     result = {**result, **generation_info}
@@ -76,10 +75,10 @@ def run_pipeline(
     extended_cases = _merge_cases(cases, optimized_cases)
     stubs = stub_function_names(context, extended_cases)
     if stubs:
-        test_source, callable_name = _prepare_test_source(source_path, build_dir, context.name, stubs)
+        test_source, callable_name = prepare_test_source(source_path, build_dir, context.name, stubs)
         context = replace(context, source=str(test_source), name=callable_name)
         context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
-    extended_cases = _fill_expected_values(context, extended_cases, source_path, build_dir)
+    extended_cases = fill_expected_values(context, extended_cases, source_path, build_dir)
     optimized_result = _write_compile_run_collect(context, extended_cases, source_path, test_source, build_dir, context_path, "optimized")
     optimized_trace = write_llm_trace(build_dir, f"{context.name}_optimization", prompt, response)
     return {
@@ -205,286 +204,6 @@ def _merge_cases(*case_groups: list[TestCase]) -> list[TestCase]:
             seen.add(identity)
             merged.append(case)
     return merged
-
-
-def _fill_expected_values(
-    context: FunctionContext,
-    cases: list[TestCase],
-    source_path: Path,
-    build_dir: Path,
-) -> list[TestCase]:
-    if _normalize_type(context.return_type) == "void":
-        return cases
-    if not _is_supported_return_context(context):
-        raise NotImplementedError(
-            "The connector currently supports scalar returns, scalar/struct pointer returns, and struct value returns."
-        )
-
-    oracle_c = build_dir / f"oracle_{context.name}.c"
-    oracle_exe = build_dir / f"oracle_{context.name}"
-    oracle_c.write_text(_oracle_source(context, cases), encoding="utf-8")
-    cmd = ["clang", "-std=c11", "-I", str(source_path.parent), str(oracle_c), "-o", str(oracle_exe)]
-    result = subprocess.run(cmd, text=True, capture_output=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Oracle compile failed:\n{result.stderr}")
-    output = subprocess.run([str(oracle_exe)], text=True, capture_output=True, check=True).stdout
-    expected_values = [_parse_expected_marker(line.split(":", 1)[1]) for line in output.splitlines() if line.startswith("__STRUT_EXPECTED__:")]
-    if len(expected_values) != len(cases):
-        raise RuntimeError(f"Oracle returned {len(expected_values)} expected values for {len(cases)} cases:\n{output}")
-    return [with_expected(case, expected) for case, expected in zip(cases, expected_values)]
-
-
-def _oracle_source(context: FunctionContext, cases: list[TestCase]) -> str:
-    lines = [
-        "#include <stdio.h>",
-        "#include <stddef.h>",
-        *stub_prelude(context, cases),
-        f'#include "{context.source}"',
-        "",
-        *stub_definitions(context, cases),
-        "int main(void)",
-        "{",
-    ]
-    for index, case in enumerate(cases, start=1):
-        lines.append(f"    /* case {index}: {case.desc} */")
-        lines.append("    {")
-        for declaration in _case_declarations(case):
-            lines.append(f"        {declaration}")
-        if case.stubins:
-            lines.append(f"        __strut_stub_case_index = {index};")
-        args = ", ".join(case.args)
-        lines.append(_oracle_print(context, f"{context.name}({args})"))
-        lines.append("    }")
-    lines.extend(["    return 0;", "}", ""])
-    return "\n".join(lines)
-
-
-def _case_declarations(case: TestCase) -> list[str]:
-    declarations: list[str] = []
-    seen: set[str] = set()
-    for binding in case.bindings:
-        for declaration in binding.declarations:
-            if declaration in seen:
-                continue
-            seen.add(declaration)
-            declarations.append(declaration)
-    return declarations
-
-
-def _oracle_print(context: FunctionContext, actual: str) -> str:
-    normalized = _normalize_type(context.return_type)
-    if normalized in {"float", "double"}:
-        return f'        printf("__STRUT_EXPECTED__:%.17g\\n", (double)({actual}));'
-    if context.return_type_kind == "pointer":
-        return _oracle_pointer_print(context, actual)
-    if context.return_type_kind == "composite":
-        return _oracle_struct_print(context, actual)
-    return f'        printf("__STRUT_EXPECTED__:%lld\\n", (long long)({actual}));'
-
-
-def _oracle_pointer_print(context: FunctionContext, actual: str) -> str:
-    variable = "__strut_actual"
-    lines = [f"        {context.return_type} {variable} = {actual};"]
-    lines.append('        printf("__STRUT_EXPECTED__:{\\"kind\\":\\"pointer\\",\\"is_null\\":%d", ' f"{variable} == NULL);")
-    lines.append(f"        if ({variable} != NULL)")
-    lines.append("        {")
-    pointee_type = context.return_pointee_type or _strip_pointer(context.return_type)
-    if context.return_fields:
-        lines.append('            printf(",\\"fields\\":{");')
-        lines.extend(_oracle_field_prints(context.return_fields, variable, pointer=True, indent="            "))
-        lines.append('            printf("}");')
-    elif _is_supported_scalar_type(pointee_type):
-        lines.append('            printf(",\\"value\\":");')
-        lines.append(_oracle_value_printf(f"*{variable}", pointee_type, indent="            "))
-    lines.append("        }")
-    lines.append('        printf("}\\n");')
-    return "\n".join(lines)
-
-
-def _oracle_struct_print(context: FunctionContext, actual: str) -> str:
-    variable = "__strut_actual"
-    lines = [f"        {context.return_type} {variable} = {actual};"]
-    lines.append('        printf("__STRUT_EXPECTED__:{\\"kind\\":\\"struct\\",\\"fields\\":{");')
-    lines.extend(_oracle_field_prints(context.return_fields, variable, pointer=False, indent="        "))
-    lines.append('        printf("}}\\n");')
-    return "\n".join(lines)
-
-
-def _oracle_field_prints(fields, variable: str, pointer: bool, indent: str) -> list[str]:
-    lines: list[str] = []
-    printable = [field for field in fields if _field_is_assertable(field)]
-    for index, field in enumerate(printable):
-        separator = "" if index == 0 else ","
-        access = f"{variable}->{field.name}" if pointer else f"{variable}.{field.name}"
-        lines.append(f'{indent}printf("{separator}\\"{field.name}\\":");')
-        if field.type_kind == "pointer":
-            lines.append(f'{indent}printf("{{\\"is_null\\":%d", {access} == NULL);')
-            pointee_type = field.pointee_type or _strip_pointer(field.c_type)
-            if _is_supported_scalar_type(pointee_type):
-                lines.append(f"{indent}if ({access} != NULL)")
-                lines.append(f"{indent}{{")
-                lines.append(f'{indent}    printf(",\\"value\\":");')
-                lines.append(_oracle_value_printf(f"*{access}", pointee_type, indent=f"{indent}    "))
-                lines.append(f"{indent}}}")
-            lines.append(f'{indent}printf("}}");')
-        elif field.type_kind == "array":
-            lines.append(_oracle_value_printf(f"{access}[0]", field.element_type or field.c_type, indent=indent))
-        elif field.type_kind == "composite":
-            lines.append('        printf("{");')
-            lines.extend(_oracle_field_prints(field.fields or [], access, pointer=False, indent=indent))
-            lines.append(f'{indent}printf("}}");')
-        else:
-            lines.append(_oracle_value_printf(access, field.c_type, indent=indent))
-    return lines
-
-
-def _oracle_value_printf(expr: str, c_type: str, indent: str) -> str:
-    normalized = _normalize_type(c_type)
-    if normalized in {"float", "double"}:
-        return f'{indent}printf("%.17g", (double)({expr}));'
-    return f'{indent}printf("%lld", (long long)({expr}));'
-
-
-def _parse_expected_marker(value: str):
-    stripped = value.strip()
-    if stripped.startswith("{"):
-        return json.loads(stripped)
-    return stripped
-
-
-def _is_supported_return_context(context: FunctionContext) -> bool:
-    if _is_supported_scalar_type(context.return_type):
-        return True
-    if context.return_type_kind == "pointer":
-        pointee_type = context.return_pointee_type or _strip_pointer(context.return_type)
-        return _is_supported_scalar_type(pointee_type) or _has_assertable_fields(context.return_fields)
-    if context.return_type_kind == "composite":
-        return _has_assertable_fields(context.return_fields)
-    return False
-
-
-def _is_supported_scalar_type(c_type: str) -> bool:
-    return _normalize_type(c_type) in {
-        "int",
-        "signed int",
-        "short",
-        "short int",
-        "long",
-        "long int",
-        "long long",
-        "long long int",
-        "unsigned",
-        "unsigned int",
-        "unsigned short",
-        "unsigned short int",
-        "unsigned long",
-        "unsigned long int",
-        "unsigned long long",
-        "unsigned long long int",
-        "bool",
-        "_Bool",
-        "float",
-        "double",
-        "char",
-        "signed char",
-        "unsigned char",
-    }
-
-
-def _has_assertable_fields(fields) -> bool:
-    return any(_field_is_assertable(field) for field in fields or [])
-
-
-def _field_is_assertable(field) -> bool:
-    if field.type_kind == "pointer":
-        return True
-    if field.type_kind == "array":
-        return _is_supported_scalar_type(field.element_type or field.c_type)
-    if field.type_kind == "composite":
-        return _has_assertable_fields(field.fields)
-    return _is_supported_scalar_type(field.c_type)
-
-
-def _strip_pointer(c_type: str) -> str:
-    return c_type.replace("*", "").strip()
-
-
-def _prepare_test_source(
-    source_path: Path,
-    build_dir: Path,
-    function_name: str,
-    stubbed_functions: set[str] | None = None,
-) -> tuple[Path, str]:
-    source = source_path.read_bytes()
-    replacements = _identifier_replacements(source, function_name, stubbed_functions or set())
-    if not replacements:
-        return source_path, function_name
-
-    rewritten = bytearray(source)
-    for start, end, name in sorted(replacements, reverse=True):
-        rewritten[start:end] = name.encode("utf-8")
-
-    test_source = build_dir / f"strut_source_{source_path.stem}.c"
-    test_source.write_bytes(bytes(rewritten))
-    callable_name = "__strut_unity_target_main" if function_name == "main" else function_name
-    return test_source, callable_name
-
-
-def _identifier_replacements(
-    source: bytes,
-    function_name: str,
-    stubbed_functions: set[str],
-) -> list[tuple[int, int, str]]:
-    parser = Parser(Language(tree_sitter_c.language()))
-    tree = parser.parse(source)
-    replacements: list[tuple[int, int, str]] = []
-    for node in _walk_tree(tree.root_node):
-        if node.type != "function_definition":
-            continue
-        identifier = _function_identifier(node)
-        if identifier is None:
-            continue
-        name = source[identifier.start_byte : identifier.end_byte].decode("utf-8", errors="replace")
-        if name == "main":
-            replacement = "__strut_unity_target_main" if function_name == "main" else "__strut_unity_disabled_main"
-            replacements.append((identifier.start_byte, identifier.end_byte, replacement))
-        elif name in stubbed_functions and name != function_name:
-            replacements.append((identifier.start_byte, identifier.end_byte, f"__strut_unity_original_{name}"))
-    return replacements
-
-
-def _function_identifier(node):
-    declarators = [child for child in _walk_tree(node) if child.type == "function_declarator"]
-    if not declarators:
-        return None
-    for child in declarators[0].children:
-        if child.type == "identifier":
-            return child
-        if child.type.endswith("declarator"):
-            nested = _first_identifier(child)
-            if nested is not None:
-                return nested
-    return None
-
-
-def _first_identifier(node):
-    if node.type == "identifier":
-        return node
-    for child in node.children:
-        found = _first_identifier(child)
-        if found is not None:
-            return found
-    return None
-
-
-def _walk_tree(node):
-    yield node
-    for child in node.children:
-        yield from _walk_tree(child)
-
-
-def _normalize_type(c_type: str) -> str:
-    return " ".join(c_type.replace("const ", "").split())
 
 
 def main() -> int:

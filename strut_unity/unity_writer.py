@@ -3,7 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 from .analyzer import FunctionContext
-from .cases import OutputValue, TestCase, convert_inputs_with_default_ptr, default_ptr_entries
+from .cases import (
+    OutputValue,
+    TestCase,
+    case_declarations,
+    case_outputs,
+    case_return_output,
+    convert_inputs_with_default_ptr,
+    default_ptr_entries,
+    is_return_output,
+)
 from .stubs import stub_definitions, stub_prelude
 
 
@@ -13,6 +22,7 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
     lines = [
         '#include "unity.h"',
         "#include <stddef.h>",
+        "#include <stdbool.h>",
         *stub_prelude(context, cases),
         f'#include "{context.source}"',
         "",
@@ -30,7 +40,7 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
                 "{",
             ]
         )
-        for declaration in _case_declarations(case):
+        for declaration in case_declarations(case):
             lines.append(f"    {declaration}")
         if case.stubins:
             lines.append(f"    __strut_stub_case_index = {index};")
@@ -39,10 +49,11 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
             lines.append(f"    {context.name}({args});")
         else:
             lines.append(f"    {context.return_type} {actual} = {context.name}({args});")
-        for assertion in _assertions(context, case.expected, actual):
+        return_output = case_return_output(context, case)
+        for assertion in _assertions(context, return_output.value if return_output else None, actual):
             lines.append(f"    {assertion}")
-        for case_output in case.outputs:
-            if _normalize_expr(case_output.expr) == _normalize_expr(f"{context.name}({', '.join(parameter.name for parameter in context.parameters)})"):
+        for case_output in case_outputs(context, case):
+            if is_return_output(context, case_output.expr):
                 continue
             for assertion in _output_assertions(_resolve_output_expr(context, case_output)):
                 lines.append(f"    {assertion}")
@@ -66,18 +77,6 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
     )
     output.write_text("\n".join(lines), encoding="utf-8")
     return output
-
-
-def _case_declarations(case: TestCase) -> list[str]:
-    declarations: list[str] = []
-    seen: set[str] = set()
-    for binding in case.bindings:
-        for declaration in binding.declarations:
-            if declaration in seen:
-                continue
-            seen.add(declaration)
-            declarations.append(declaration)
-    return declarations
 
 
 def _assertions(context: FunctionContext, expected, actual: str) -> list[str]:
@@ -212,7 +211,3 @@ def _normalize_type(c_type: str) -> str:
 
 def _strip_pointer(c_type: str) -> str:
     return c_type.replace("*", "").strip()
-
-
-def _normalize_expr(expr: str) -> str:
-    return "".join(expr.split())

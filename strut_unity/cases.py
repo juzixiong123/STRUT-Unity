@@ -36,13 +36,28 @@ class ArgumentBinding:
     inputs: tuple[InputValue, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class TestCase:
     desc: str
     bindings: tuple[ArgumentBinding, ...]
-    expected: Any | None = None
     stubins: tuple[StubIn, ...] = ()
     outputs: tuple[OutputValue, ...] = ()
+
+    def __init__(
+        self,
+        desc: str,
+        bindings: tuple[ArgumentBinding, ...],
+        expected: Any | None = None,
+        stubins: tuple[StubIn, ...] = (),
+        outputs: tuple[OutputValue, ...] = (),
+    ):
+        normalized_outputs = tuple(outputs)
+        if expected is not None and not any(_is_generic_return_expr(output.expr) for output in normalized_outputs):
+            normalized_outputs = (*normalized_outputs, OutputValue("returnValue", "", expected))
+        object.__setattr__(self, "desc", desc)
+        object.__setattr__(self, "bindings", tuple(bindings))
+        object.__setattr__(self, "stubins", tuple(stubins))
+        object.__setattr__(self, "outputs", normalized_outputs)
 
     @property
     def args(self) -> tuple[str, ...]:
@@ -51,6 +66,13 @@ class TestCase:
     @property
     def input_values(self) -> tuple[InputValue, ...]:
         return tuple(value for binding in self.bindings for value in binding.inputs)
+
+    @property
+    def expected(self) -> Any | None:
+        for output in self.outputs:
+            if _is_generic_return_expr(output.expr):
+                return output.value
+        return None
 
     def identity(self) -> tuple[tuple[str, str], ...]:
         stub_identity = tuple(
@@ -84,25 +106,14 @@ def to_original_seed_case(context: FunctionContext, case: TestCase, backend: boo
     if backend:
         inputs = convert_inputs_with_default_ptr(inputs, default_ptr_entries(context))
 
-    return_expr = _return_expr(context)
-    outputs = []
-    if case.expected is not None:
-        outputs.append(
-            {
-                "expr": return_expr,
-                "type": context.return_type,
-                "value": case.expected,
-            }
-        )
-    outputs.extend(
+    outputs = [
         {
             "expr": output.expr,
-            "type": output.c_type,
+            "type": _output_type(context, output),
             "value": output.value,
         }
-        for output in case.outputs
-        if _normalize_expr(output.expr) != _normalize_expr(return_expr)
-    )
+        for output in case_outputs(context, case)
+    ]
     return {
         "desc": case.desc,
         "inputs": inputs,
@@ -133,6 +144,37 @@ def _stub_to_json(stub: StubIn) -> dict[str, Any]:
 
 def _return_expr(context: FunctionContext) -> str:
     return f"{context.name}({', '.join(parameter.name for parameter in context.parameters)})"
+
+
+def is_return_output(context: FunctionContext, expr: str) -> bool:
+    normalized = _normalize_expr(expr).lower()
+    return normalized in _generic_return_exprs() or normalized == _normalize_expr(_return_expr(context)).lower()
+
+
+def case_return_output(context: FunctionContext, case: TestCase) -> OutputValue | None:
+    for output in case.outputs:
+        if is_return_output(context, output.expr):
+            return _normalize_return_output(context, output)
+    return None
+
+
+def case_outputs(context: FunctionContext, case: TestCase) -> tuple[OutputValue, ...]:
+    return tuple(
+        _normalize_return_output(context, output) if is_return_output(context, output.expr) else output
+        for output in case.outputs
+    )
+
+
+def case_declarations(case: TestCase) -> list[str]:
+    declarations: list[str] = []
+    seen: set[str] = set()
+    for binding in case.bindings:
+        for declaration in binding.declarations:
+            if declaration in seen:
+                continue
+            seen.add(declaration)
+            declarations.append(declaration)
+    return declarations
 
 
 def generate_seed_cases(context: FunctionContext) -> list[TestCase]:
@@ -198,13 +240,19 @@ def case_from_args(
     return TestCase(desc=desc, bindings=tuple(bindings), stubins=stubins, outputs=outputs)
 
 
-def with_expected(case: TestCase, expected: Any) -> TestCase:
+def with_expected(case: TestCase, expected: Any, context: FunctionContext | None = None) -> TestCase:
+    return_expr = _return_expr(context) if context is not None else "returnValue"
+    return_type = context.return_type if context is not None else ""
+    outputs = tuple(
+        output
+        for output in case.outputs
+        if not (_is_generic_return_expr(output.expr) or (context is not None and is_return_output(context, output.expr)))
+    )
     return TestCase(
         desc=case.desc,
         bindings=case.bindings,
-        expected=expected,
         stubins=case.stubins,
-        outputs=case.outputs,
+        outputs=(*outputs, OutputValue(return_expr, return_type, expected)),
     )
 
 
@@ -214,6 +262,24 @@ def _append_case(cases: list[TestCase], seen: set[tuple[tuple[str, str], ...]], 
         return
     seen.add(identity)
     cases.append(case)
+
+
+def _normalize_return_output(context: FunctionContext, output: OutputValue) -> OutputValue:
+    return OutputValue(expr=_return_expr(context), c_type=output.c_type or context.return_type, value=output.value)
+
+
+def _output_type(context: FunctionContext, output: OutputValue) -> str:
+    if is_return_output(context, output.expr):
+        return output.c_type or context.return_type
+    return output.c_type
+
+
+def _is_generic_return_expr(expr: str) -> bool:
+    return _normalize_expr(expr).lower() in _generic_return_exprs()
+
+
+def _generic_return_exprs() -> set[str]:
+    return {"return", "returnvalue", "retval", "__return"}
 
 
 def _binding_for_parameter(

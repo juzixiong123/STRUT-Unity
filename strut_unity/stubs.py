@@ -38,7 +38,7 @@ def stub_prelude(context: FunctionContext, cases: list[TestCase]) -> list[str]:
     signatures = _stub_signatures(context, cases)
     if not signatures:
         return []
-    lines = ["static int __strut_stub_case_index = 0;"]
+    lines = [*_stub_type_declarations(context, signatures), "static int __strut_stub_case_index = 0;"]
     for signature in signatures.values():
         lines.append(_prototype(signature))
     lines.append("")
@@ -97,6 +97,71 @@ def _stub_signatures(context: FunctionContext, cases: list[TestCase]) -> dict[st
             source = declaration_sources.get(name) or stub.called_function
             signatures[name] = _parse_signature(name, source)
     return signatures
+
+
+def _stub_type_declarations(context: FunctionContext, signatures: dict[str, StubSignature]) -> list[str]:
+    needed = set()
+    for signature in signatures.values():
+        for text in (signature.return_type, *signature.parameters):
+            needed.update(_type_identifiers(text))
+
+    typedefs = {item.name: item.source for item in context.dependency_details.typedefs if item.source}
+    structs = {item.name: item.source for item in context.dependency_details.structs if item.source}
+    declarations: list[str] = []
+    seen: set[str] = set()
+    for name in sorted(needed):
+        source = typedefs.get(name)
+        if source:
+            declaration = _forward_typedef(source, name)
+        elif name in structs:
+            declaration = f"struct {name};"
+        else:
+            declaration = ""
+        if declaration and declaration not in seen:
+            seen.add(declaration)
+            declarations.append(declaration)
+    return declarations
+
+
+def _type_identifiers(text: str) -> set[str]:
+    identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", text))
+    return {
+        item
+        for item in identifiers
+        if item
+        not in {
+            "arg",
+            "bool",
+            "_Bool",
+            "char",
+            "const",
+            "double",
+            "float",
+            "int",
+            "long",
+            "short",
+            "signed",
+            "struct",
+            "unsigned",
+            "void",
+            "volatile",
+        }
+        and not re.fullmatch(r"arg\d+", item)
+    }
+
+
+def _forward_typedef(source: str, name: str) -> str:
+    text = " ".join(source.split())
+    text = text if text.endswith(";") else f"{text};"
+    if "{" not in text:
+        return text
+    match = re.search(r"typedef\s+struct\s+([A-Za-z_]\w*)\s*\{", text)
+    if match:
+        return f"typedef struct {match.group(1)} {name};"
+    match = re.search(r"typedef\s+(union|enum)\s+([A-Za-z_]\w*)\s*\{", text)
+    if match:
+        return f"typedef {match.group(1)} {match.group(2)} {name};"
+    return ""
 
 
 def _parse_signature(name: str, source: str) -> StubSignature:
