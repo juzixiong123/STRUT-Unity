@@ -37,7 +37,9 @@ def run_pipeline(
     context = analyze_function(source_path, function)
     test_source, callable_name = prepare_test_source(source_path, build_dir, context.name)
     context = replace(context, source=str(test_source), name=callable_name)
-    source_code = source_path.read_text(encoding="utf-8")
+    #source_code = source_path.read_text(encoding="utf-8")
+    source_lines = source_path.read_text(encoding="utf-8").splitlines()
+    source_code = "\n".join(source_lines[context.start_line - 1 : context.end_line])
     context_path = build_dir / f"{context.name}_context.json"
     context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
 
