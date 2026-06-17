@@ -54,16 +54,15 @@ def parse_llm_cases(response: str, context: FunctionContext) -> list[TestCase]:
 
 def _case_from_item(item: dict, context: FunctionContext, desc: str) -> TestCase:
     stubins = _parse_stubins(item)
-    outputs = _parse_outputs(item)
     if "args" in item:
-        return case_from_args(context, desc, list(item["args"]), stubins=stubins, outputs=outputs)
+        return case_from_args(context, desc, list(item["args"]), stubins=stubins)
 
     inputs = item.get("inputs")
     if not isinstance(inputs, list):
         raise ValueError("LLM case must contain either args or inputs")
 
     values_by_expr = {str(entry.get("expr")): entry.get("value") for entry in inputs if isinstance(entry, dict)}
-    return case_from_structured_inputs(context, desc, values_by_expr, stubins=stubins, outputs=outputs)
+    return case_from_structured_inputs(context, desc, values_by_expr, stubins=stubins)
 
 
 def _parse_stubins(item: dict) -> tuple[StubIn, ...]:
@@ -81,13 +80,6 @@ def _parse_stubins(item: dict) -> tuple[StubIn, ...]:
         values = tuple(_output_value(entry) for entry in changed if isinstance(entry, dict))
         stubins.append(StubIn(called_function=str(called), changed_variables=values))
     return tuple(stubins)
-
-
-def _parse_outputs(item: dict) -> tuple[OutputValue, ...]:
-    raw_outputs = item.get("outputs", [])
-    if not isinstance(raw_outputs, list):
-        return ()
-    return tuple(_output_value(entry) for entry in raw_outputs if isinstance(entry, dict))
 
 
 def _output_value(entry: dict) -> OutputValue:

@@ -8,7 +8,7 @@ import subprocess
 
 from .analyzer import analyze_function, FunctionContext
 from .cases import generate_seed_cases, TestCase
-from .coverage import collect_gcov_coverage, estimate_branch_coverage
+from .coverage import collect_gcov_coverage
 from .llm_cases import generate_llm_cases, generate_optimized_llm_cases
 from .llm_client import LLMConfig, OpenAICompatibleClient, write_llm_trace
 from .oracle import fill_expected_values
@@ -37,7 +37,6 @@ def run_pipeline(
     context = analyze_function(source_path, function)
     test_source, callable_name = prepare_test_source(source_path, build_dir, context.name)
     context = replace(context, source=str(test_source), name=callable_name)
-    #source_code = source_path.read_text(encoding="utf-8")
     source_lines = source_path.read_text(encoding="utf-8").splitlines()
     source_code = "\n".join(source_lines[context.start_line - 1 : context.end_line])
     context_path = build_dir / f"{context.name}_context.json"
@@ -61,28 +60,51 @@ def run_pipeline(
     result = _write_compile_run_collect(context, cases, source_path, test_source, build_dir, context_path, "initial")
 
     result = {**result, **generation_info}
-    uncovered = result.get("coverage", {}).get("estimated", {}).get("uncovered_conditions", [])
+    uncovered = result.get("coverage", {}).get("gcov", {}).get("uncovered_conditions", [])
     if not (optimize and case_source in {"llm", "hybrid"} and uncovered and result.get("run_returncode") == 0):
         return result
 
-    config = LLMConfig.from_values(base_url=llm_base_url, model=llm_model, api_key=llm_api_key)
-    client = OpenAICompatibleClient(config)
-    optimized_cases, prompt, response = generate_optimized_llm_cases(
-        context,
-        source_code,
-        cases,
-        uncovered,
-        client,
-    )
-    extended_cases = _merge_cases(cases, optimized_cases)
-    stubs = stub_function_names(context, extended_cases)
-    if stubs:
-        test_source, callable_name = prepare_test_source(source_path, build_dir, context.name, stubs)
-        context = replace(context, source=str(test_source), name=callable_name)
-        context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
-    extended_cases = fill_expected_values(context, extended_cases, source_path, build_dir)
-    optimized_result = _write_compile_run_collect(context, extended_cases, source_path, test_source, build_dir, context_path, "optimized")
-    optimized_trace = write_llm_trace(build_dir, f"{context.name}_optimization", prompt, response)
+    try:
+        config = LLMConfig.from_values(base_url=llm_base_url, model=llm_model, api_key=llm_api_key)
+        client = OpenAICompatibleClient(config)
+        optimized_cases, prompt, response = generate_optimized_llm_cases(
+            context,
+            source_code,
+            cases,
+            uncovered,
+            client,
+        )
+        extended_cases = _merge_cases(cases, optimized_cases)
+        stubs = stub_function_names(context, extended_cases)
+        if stubs:
+            test_source, callable_name = prepare_test_source(source_path, build_dir, context.name, stubs)
+            context = replace(context, source=str(test_source), name=callable_name)
+            context_path.write_text(json.dumps(context.to_dict(), indent=2), encoding="utf-8")
+        extended_cases = fill_expected_values(context, extended_cases, source_path, build_dir)
+        optimized_result = _write_compile_run_collect(context, extended_cases, source_path, test_source, build_dir, context_path, "optimized")
+        optimized_trace = write_llm_trace(build_dir, f"{context.name}_optimization", prompt, response)
+    except Exception as exc:
+        return {
+            **result,
+            "optimization": {
+                "enabled": True,
+                "failed": True,
+                "error": str(exc),
+                "uncovered_conditions": uncovered,
+            },
+        }
+    if optimized_result.get("compile_returncode") != 0 or optimized_result.get("run_returncode") != 0:
+        return {
+            **result,
+            "optimization": {
+                "enabled": True,
+                "failed": True,
+                "uncovered_conditions": uncovered,
+                "added_cases": len(extended_cases) - len(cases),
+                **optimized_trace,
+            },
+            "optimized_result": optimized_result,
+        }
     return {
         **optimized_result,
         **generation_info,
@@ -143,7 +165,6 @@ def _write_compile_run_collect(
         }
 
     run_result = subprocess.run([str(exe_path)], text=True, capture_output=True, check=False)
-    estimated_coverage = estimate_branch_coverage(context, cases)
     gcov_coverage = collect_gcov_coverage(context, test_source, test_path, ROOT / "unity", build_dir, label)
     return {
         "context": str(context_path),
@@ -158,10 +179,7 @@ def _write_compile_run_collect(
         "run_returncode": run_result.returncode,
         "run_stdout": run_result.stdout,
         "run_stderr": run_result.stderr,
-        "coverage": {
-            "estimated": estimated_coverage,
-            "gcov": gcov_coverage,
-        },
+        "coverage": {"gcov": gcov_coverage},
     }
 
 

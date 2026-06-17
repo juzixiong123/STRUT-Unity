@@ -13,7 +13,7 @@ from .cases import (
     default_ptr_entries,
     is_return_output,
 )
-from .stubs import stub_definitions, stub_prelude
+from .stubs import stub_definitions, stub_function_names, stub_prelude
 
 
 def write_unity_test(context: FunctionContext, cases: list[TestCase], output_path: str | Path) -> Path:
@@ -42,7 +42,7 @@ def write_unity_test(context: FunctionContext, cases: list[TestCase], output_pat
         )
         for declaration in case_declarations(case):
             lines.append(f"    {declaration}")
-        if case.stubins:
+        if stub_function_names(context, [case]):
             lines.append(f"    __strut_stub_case_index = {index};")
         actual = "__strut_actual"
         if _normalize_type(context.return_type) == "void":

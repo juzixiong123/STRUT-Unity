@@ -275,11 +275,14 @@ def _output_type(context: FunctionContext, output: OutputValue) -> str:
 
 
 def _is_generic_return_expr(expr: str) -> bool:
-    return _normalize_expr(expr).lower() in _generic_return_exprs()
+    normalized = _normalize_expr(expr).lower()
+    if normalized in _generic_return_exprs():
+        return True
+    return any(normalized.startswith(f"{name}(") for name in _generic_return_exprs())
 
 
 def _generic_return_exprs() -> set[str]:
-    return {"return", "returnvalue", "retval", "__return"}
+    return {"return", "return_value", "returnvalue", "retval", "__return"}
 
 
 def _binding_for_parameter(
@@ -413,7 +416,9 @@ def _field_initialization(
             _normalize_expr(f"{expr}[0]"),
             overrides.get(_normalize_expr(f"*{expr}"), _default_value_for_type(pointee_type)),
         )
-        return [f"{pointee_type} {target} = {_literal_for_type(pointee_type, value)};", f"{access} = &{target};"], [
+        length = _pointer_target_length(public_base, expr, overrides)
+        literal = _literal_for_type(pointee_type, value)
+        return [f"{pointee_type} {target}[{length}] = {{{literal}}};", f"{access} = {target};"], [
             InputValue(expr=f"{expr}[0]", c_type=pointee_type, value=value)
         ]
 
@@ -421,6 +426,35 @@ def _field_initialization(
     return [f"{access} = {_literal_for_type(field.c_type, value)};"], [
         InputValue(expr=expr, c_type=field.c_type, value=value)
     ]
+
+
+def _pointer_target_length(public_base: str, expr: str, overrides: dict[str, str]) -> int:
+    length = 1
+    for size_expr in (f"{public_base}->size", f"{public_base}.size"):
+        parsed = _positive_int(overrides.get(_normalize_expr(size_expr)))
+        if parsed is not None:
+            length = max(length, parsed)
+
+    indexed_expr = re.compile(rf"{re.escape(_normalize_expr(expr))}\[(\d+)\]")
+    for override_expr in overrides:
+        match = indexed_expr.fullmatch(override_expr)
+        if match:
+            length = max(length, int(match.group(1)) + 1)
+
+    position = _positive_int(overrides.get("position"))
+    if position is not None:
+        length = max(length, position + 1)
+    return min(length, 1024)
+
+
+def _positive_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(float(value))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _interesting_values(parameter: Parameter, conditions: list[str]) -> list[str]:

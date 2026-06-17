@@ -1,53 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from .analyzer import FunctionContext
-from .cases import TestCase
-
-
-@dataclass(frozen=True)
-class BranchOutcome:
-    condition: str
-    true_covered: bool
-    false_covered: bool
-    evaluable: bool
-
-
-def estimate_branch_coverage(context: FunctionContext, cases: list[TestCase]) -> dict:
-    outcomes = []
-    for condition in context.branch_conditions:
-        seen_true = False
-        seen_false = False
-        evaluable = True
-        for case in cases:
-            value = _evaluate_condition(condition, context, case)
-            if value is None:
-                evaluable = False
-                continue
-            seen_true = seen_true or value
-            seen_false = seen_false or not value
-        outcomes.append(BranchOutcome(condition, seen_true, seen_false, evaluable))
-
-    total = 2 * len(outcomes)
-    covered = sum(int(item.true_covered) + int(item.false_covered) for item in outcomes)
-    uncovered = []
-    for item in outcomes:
-        if not item.true_covered:
-            uncovered.append(f"if ({item.condition}): true condition uncovered")
-        if not item.false_covered:
-            uncovered.append(f"if ({item.condition}): false condition uncovered")
-    return {
-        "branch_outcomes": [item.__dict__ for item in outcomes],
-        "covered_branch_outcomes": covered,
-        "total_branch_outcomes": total,
-        "estimated_branch_coverage_percent": round((covered / total) * 100, 2) if total else 100.0,
-        "uncovered_conditions": uncovered,
-    }
 
 
 def collect_gcov_coverage(
@@ -144,41 +102,6 @@ def collect_gcov_coverage(
     }
 
 
-def _evaluate_condition(condition: str, context: FunctionContext, case: TestCase) -> bool | None:
-    expression = re.sub(r"\s*->\s*", "->", condition)
-    expression = re.sub(r"(-?\d+(?:\.\d+)?)[fFuUlL]+\b", r"\1", expression)
-    replacements = {}
-    for value in case.input_values:
-        if value.value == "NULL":
-            continue
-        replacements[value.expr] = value.value
-        pointer_index = re.fullmatch(r"([A-Za-z_]\w*)\[0\]", value.expr)
-        if pointer_index:
-            replacements[f"*{pointer_index.group(1)}"] = value.value
-        pointer_deref = re.fullmatch(r"\*([A-Za-z_]\w*)", value.expr)
-        if pointer_deref:
-            replacements[f"{pointer_deref.group(1)}[0]"] = value.value
-    replacements.update(
-        {
-            binding.parameter: "0" if binding.argument == "NULL" else "1"
-            for binding in case.bindings
-            if "*" in binding.c_type or binding.argument == "NULL"
-        }
-    )
-    for expr, value in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
-        expression = expression.replace(re.sub(r"\s*->\s*", "->", expr), value)
-    expression = re.sub(r"\bNULL\b", "0", expression)
-    expression = expression.replace("&&", " and ").replace("||", " or ")
-    expression = re.sub(r"!(?!=)", " not ", expression)
-    identifier_check = re.sub(r"\b(?:and|or|not)\b", "", expression)
-    if re.search(r"[A-Za-z_]", identifier_check):
-        return None
-    try:
-        return bool(eval(expression, {"__builtins__": {}}, {}))
-    except Exception:
-        return None
-
-
 def _parse_gcov_output(output: str, source_path: Path) -> dict:
     output = _source_gcov_section(output, source_path)
     parsed: dict[str, float | int] = {}
@@ -212,6 +135,7 @@ def _parse_function_gcov_file(coverage_dir: Path, source_path: Path, context: Fu
             "function_end_line": context.end_line,
             "line_coverage_percent": None,
             "branch_coverage_percent": None,
+            "block_coverage_percent": None,
             "reason": f"gcov file not found: {gcov_path}",
         }
 
@@ -219,14 +143,24 @@ def _parse_function_gcov_file(coverage_dir: Path, source_path: Path, context: Fu
     covered_lines = 0
     instrumented_branches = 0
     covered_branches = 0
+    block_coverage_percent: float | None = None
+    uncovered_branches: list[dict] = []
     current_source_line: int | None = None
+    current_source_text = ""
+    source_lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     for raw_line in gcov_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        function_match = re.match(r"\s*function\s+(\S+)\s+called\b.*\bblocks executed\s+([0-9.]+)%", raw_line)
+        if function_match and function_match.group(1) == context.name:
+            block_coverage_percent = float(function_match.group(2))
+            continue
+
         source_match = re.match(r"\s*([^:]+):\s*(\d+):(.*)$", raw_line)
         if source_match:
             count_text = source_match.group(1).strip()
             line_number = int(source_match.group(2))
             current_source_line = line_number
+            current_source_text = source_match.group(3)
             if context.start_line <= line_number <= context.end_line and _is_instrumented_count(count_text):
                 instrumented_lines += 1
                 if _is_executed_count(count_text):
@@ -235,12 +169,24 @@ def _parse_function_gcov_file(coverage_dir: Path, source_path: Path, context: Fu
 
         if current_source_line is None or not (context.start_line <= current_source_line <= context.end_line):
             continue
-        branch_match = re.match(r"\s*branch\s+\d+\s+(.*)$", raw_line)
+        branch_match = re.match(r"\s*branch\s+(\d+)\s+(.*)$", raw_line)
         if not branch_match:
             continue
+        branch_index = int(branch_match.group(1))
+        branch_text = branch_match.group(2)
         instrumented_branches += 1
-        if _branch_was_taken(branch_match.group(1)):
+        if _branch_was_taken(branch_text):
             covered_branches += 1
+        else:
+            uncovered_branches.append(
+                _uncovered_branch(
+                    source_lines,
+                    current_source_line,
+                    current_source_text,
+                    branch_index,
+                    branch_text,
+                )
+            )
 
     return {
         "coverage_scope": "function",
@@ -257,6 +203,9 @@ def _parse_function_gcov_file(coverage_dir: Path, source_path: Path, context: Fu
         "branch_coverage_percent": round((covered_branches / instrumented_branches) * 100, 2)
         if instrumented_branches
         else 100.0,
+        "block_coverage_percent": block_coverage_percent,
+        "uncovered_branches": uncovered_branches,
+        "uncovered_conditions": [item["description"] for item in uncovered_branches],
     }
 
 
@@ -281,6 +230,86 @@ def _branch_was_taken(branch_text: str) -> bool:
     if percent:
         return float(percent.group(1)) > 0
     return False
+
+
+def _uncovered_branch(
+    source_lines: list[str],
+    line_number: int,
+    source_text: str,
+    branch_index: int,
+    branch_text: str,
+) -> dict:
+    control = _control_for_line(source_lines, line_number)
+    keyword = control[0] if control else "condition"
+    condition = control[1] if control else " ".join(source_text.split())
+    direction = _branch_direction(branch_index)
+    description = (
+        f"line {line_number}: {keyword} ({condition}): {direction} branch uncovered "
+        f"(gcov branch {branch_index}, {branch_text})"
+    )
+    return {
+        "line": line_number,
+        "branch_index": branch_index,
+        "branch_text": branch_text,
+        "control": keyword,
+        "condition": condition,
+        "direction": direction,
+        "description": description,
+    }
+
+
+def _branch_direction(branch_index: int) -> str:
+    return "true/fallthrough" if branch_index % 2 == 0 else "false/non-fallthrough"
+
+
+def _control_for_line(source_lines: list[str], line_number: int) -> tuple[str, str] | None:
+    if line_number < 1 or line_number > len(source_lines):
+        return None
+    statement = _control_statement_from_line(source_lines, line_number)
+    return _extract_control_condition(statement)
+
+
+def _control_statement_from_line(source_lines: list[str], line_number: int) -> str:
+    pieces = []
+    depth = 0
+    saw_open = False
+    for line in source_lines[line_number - 1 :]:
+        pieces.append(line.strip())
+        for char in line:
+            if char == "(":
+                depth += 1
+                saw_open = True
+            elif char == ")" and saw_open:
+                depth -= 1
+                if depth <= 0:
+                    return " ".join(pieces)
+        if saw_open and depth <= 0:
+            break
+    return " ".join(pieces)
+
+
+def _extract_control_condition(statement: str) -> tuple[str, str] | None:
+    match = re.search(r"\b(if|while|for|switch)\s*\(", statement)
+    if not match:
+        return None
+    keyword = match.group(1)
+    start = statement.find("(", match.end() - 1)
+    if start == -1:
+        return None
+    depth = 0
+    pieces = []
+    for char in statement[start:]:
+        if char == "(":
+            depth += 1
+            if depth == 1:
+                continue
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return keyword, " ".join("".join(pieces).split())
+        if depth >= 1:
+            pieces.append(char)
+    return None
 
 
 def _prefix_keys(data: dict, prefix: str) -> dict:

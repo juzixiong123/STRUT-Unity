@@ -31,7 +31,10 @@ def stub_name(context: FunctionContext, stub: StubIn) -> str | None:
         if re.search(rf"\b{re.escape(dependency)}\b", raw):
             return dependency
     match = re.search(r"\b([A-Za-z_]\w*)\s*\(", raw)
-    return match.group(1) if match else None
+    if not match:
+        return None
+    name = match.group(1)
+    return None if name == context.name else name
 
 
 def stub_prelude(context: FunctionContext, cases: list[TestCase]) -> list[str]:

@@ -5,8 +5,8 @@ from pathlib import Path
 import subprocess
 
 from .analyzer import FunctionContext
-from .cases import TestCase, case_declarations, case_return_output, with_expected
-from .stubs import stub_definitions, stub_prelude
+from .cases import TestCase, case_declarations, with_expected
+from .stubs import stub_definitions, stub_function_names, stub_prelude
 
 
 def fill_expected_values(
@@ -17,22 +17,14 @@ def fill_expected_values(
 ) -> list[TestCase]:
     if _normalize_type(context.return_type) == "void":
         return cases
-    missing_indexes = [
-        index
-        for index, case in enumerate(cases)
-        if (return_output := case_return_output(context, case)) is None or return_output.value is None
-    ]
-    if not missing_indexes:
-        return cases
     if not _is_supported_return_context(context):
         raise NotImplementedError(
             "The connector currently supports scalar returns, scalar/struct pointer returns, and struct value returns."
         )
 
-    oracle_cases = [cases[index] for index in missing_indexes]
     oracle_c = build_dir / f"oracle_{context.name}.c"
     oracle_exe = build_dir / f"oracle_{context.name}"
-    oracle_c.write_text(_oracle_source(context, oracle_cases), encoding="utf-8")
+    oracle_c.write_text(_oracle_source(context, cases), encoding="utf-8")
     cmd = ["clang", "-std=c11", "-I", str(source_path.parent), str(oracle_c), "-o", str(oracle_exe)]
     result = subprocess.run(cmd, text=True, capture_output=True, check=False)
     if result.returncode != 0:
@@ -44,11 +36,11 @@ def fill_expected_values(
         for line in output.splitlines()
         if line.startswith("__STRUT_EXPECTED__:")
     ]
-    if len(expected_values) != len(oracle_cases):
-        raise RuntimeError(f"Oracle returned {len(expected_values)} expected values for {len(oracle_cases)} cases:\n{output}")
+    if len(expected_values) != len(cases):
+        raise RuntimeError(f"Oracle returned {len(expected_values)} expected values for {len(cases)} cases:\n{output}")
 
     filled = list(cases)
-    for index, expected in zip(missing_indexes, expected_values):
+    for index, expected in enumerate(expected_values):
         filled[index] = with_expected(filled[index], expected, context)
     return filled
 
@@ -70,7 +62,7 @@ def _oracle_source(context: FunctionContext, cases: list[TestCase]) -> str:
         lines.append("    {")
         for declaration in case_declarations(case):
             lines.append(f"        {declaration}")
-        if case.stubins:
+        if stub_function_names(context, [case]):
             lines.append(f"        __strut_stub_case_index = {index};")
         args = ", ".join(case.args)
         lines.append(_oracle_print(context, f"{context.name}({args})"))
